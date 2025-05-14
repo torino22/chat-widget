@@ -1,10 +1,16 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from faster_whisper import WhisperModel
+import ffmpeg, io, soundfile as sf, traceback
 from typing import List
 from pydantic import BaseModel
 from openai import OpenAI
 import re
 import json
+from fastapi.responses import FileResponse
+import asyncio
+import edge_tts
+import uuid
 import os
 from dotenv import load_dotenv
 
@@ -24,6 +30,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+model = WhisperModel("large-v3", device="cpu", compute_type="int8")
 
 # Define request model
 class PromptRequest(BaseModel):
@@ -79,7 +87,7 @@ You're the Soft Suave onboarding companion! Congrats on your new role 🎉 As yo
 1. Full legal name (so we get your paperwork right 😉)
 2. Preferred name (if you go by something else)
 3. Employee ID (you'll find this in your offer letter)
-4. Start date (YYYY-MM-DD)
+4. Start date (either YYYY-MM-DD or how someone would say it with month name and date and year )
 5. Personal email address
 6. Mobile phone number
 7. Mailing address (Street, City, State, ZIP)
@@ -176,3 +184,69 @@ That's it—just let me know the first thing: your full legal name!
             }
         }
 
+def decode_webm_to_pcm(audio_bytes: bytes):
+    """
+    In-memory decode from WebM/Opus → WAV/PCM (16kHz, mono).
+    Returns: (numpy.ndarray, sample_rate)
+    """
+    try:
+        # Run ffmpeg to convert input bytes (pipe:0) to wav bytes (pipe:1)
+        wav_bytes, _ = (
+            ffmpeg
+            .input("pipe:0")
+            .output("pipe:1",
+                    format="wav",
+                    acodec="pcm_s16le",
+                    ac=1,
+                    ar="16000")
+            .run(input=audio_bytes, capture_stdout=True, capture_stderr=True)
+        )
+        # Now read those wav bytes into numpy
+        audio_arr, sr = sf.read(io.BytesIO(wav_bytes))
+        return audio_arr, sr
+
+    except ffmpeg.Error as e:
+        # ffmpeg stderr is in e.stderr
+        raise RuntimeError(f"FFmpeg decoding error: {e.stderr.decode()}")
+
+@app.post("/transcribe/")
+async def transcribe(file: UploadFile = File(...)):
+    """Accepts WebM/Opus upload and returns transcription"""
+    audio_bytes = await file.read()
+
+    try:
+        # 1️⃣ Decode WebM → PCM
+        audio_data, sample_rate = decode_webm_to_pcm(audio_bytes)
+
+        # 2️⃣ Transcribe with chunking + VAD
+        segments, info = model.transcribe(
+            audio_data
+        )
+
+        # 3️⃣ Concatenate segment texts
+        text = " ".join(seg.text for seg in segments).strip()
+        return {"text": text}
+
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Transcription error: {e}")
+    
+class TTSRequest(BaseModel):
+    text: str
+    voice: str = "en-US-JennyNeural"  # Default voice
+
+@app.post("/tts/")
+async def generate_tts(request: TTSRequest):
+    text = request.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text cannot be empty")
+
+    filename = f"tts_{uuid.uuid4().hex}.mp3"
+    filepath = f"./{filename}"
+
+    try:
+        communicate = edge_tts.Communicate(text, voice=request.voice)
+        await communicate.save(filepath)
+        return FileResponse(filepath, media_type="audio/mpeg", filename="output.mp3")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TTS generation failed: {e}")
