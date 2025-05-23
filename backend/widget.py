@@ -1,16 +1,16 @@
 from fastapi import FastAPI, HTTPException, File, UploadFile
-import requests
-from transformers import pipeline
-import torch 
-import time
 from fastapi.middleware.cors import CORSMiddleware
-from requests.auth import HTTPBasicAuth
+from faster_whisper import WhisperModel
+import ffmpeg, io, soundfile as sf, traceback
 from typing import List
 from pydantic import BaseModel
 from openai import OpenAI
-from database import get_connection
 import re
 import json
+from fastapi.responses import FileResponse
+import asyncio
+import edge_tts
+import uuid
 import os
 from dotenv import load_dotenv
 
@@ -30,6 +30,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+model = WhisperModel("large-v3", device="cpu", compute_type="int8")
 
 # Define request model
 class PromptRequest(BaseModel):
@@ -85,7 +87,7 @@ You're the Soft Suave onboarding companion! Congrats on your new role 🎉 As yo
 1. Full legal name (so we get your paperwork right 😉)
 2. Preferred name (if you go by something else)
 3. Employee ID (you'll find this in your offer letter)
-4. Start date (YYYY-MM-DD)
+4. Start date (either YYYY-MM-DD or how someone would say it with month name and date and year )
 5. Personal email address
 6. Mobile phone number
 7. Mailing address (Street, City, State, ZIP)
@@ -182,132 +184,74 @@ That's it—just let me know the first thing: your full legal name!
             }
         }
 
-
-class Lead(BaseModel):
-    name: str
-    email: str
-    requirement: str
-    company: str
-    phone: str
-    meetingslot: str
-
-@app.post("/api/leads")
-def create_lead(lead: Lead):
-  try:
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    sql = "INSERT INTO leads (name, email, requirement, company, phone, meetingslot) VALUES (%s, %s, %s, %s, %s, %s)"
-    values = (lead.name, lead.email, lead.requirement, lead.company, lead.phone, lead.meetingslot)
-
-    cursor.execute(sql, values)
-    conn.commit()
-
-    return {"message": "Lead saved successfully!"}
-
-  except Exception as e:
-    print(f"Database Error: {e}")
-    return {"error": str(e)}
-
-  finally:
-    cursor.close()
-    conn.close()
-
-
-
-class MeetingInvitee(BaseModel):
-    email: str
-
-class Settings(BaseModel):
-    meeting_invitees: List[MeetingInvitee]
-    email_notification: bool
-    contact_email: str
-    contact_name: str
-
-class CreateMeetingRequest(BaseModel):
-    start_time: str          # ISO8601 datetime
-    timezone: str            # e.g. "America/Los_Angeles"
-    topic: str               # Meeting topic
-    type: int                # Meeting type (e.g. 2 = scheduled)
-    agenda: str              # Meeting agenda
-    duration: int            # Duration in minutes
-    settings: Settings       # Nested settings block
-
-
-token_data = {
-    "access_token": None,
-    "expires_at": 0,  # Unix timestamp
-}
-
-ZOOM_CLIENT_ID     = 'CAi9VUMuSBaQWVflliHUQw'
-ZOOM_CLIENT_SECRET = 'cfU2p2KUeHfF71UyBerbfsbHK81e0423'
-ZOOM_ACCOUNT_ID = 'DyB116CjTfWXUNkSAmf-2w'
-
-def get_valid_access_token():
-    now = time.time()
-    # Return existing token if still valid
-    if token_data["access_token"] and now < token_data["expires_at"]:
-        return token_data["access_token"]
-
-    # Fetch a fresh token via client_credentials grant
-    resp = requests.post(
-        "https://zoom.us/oauth/token",
-        params={
-            "grant_type": "account_credentials",
-            "account_id": ZOOM_ACCOUNT_ID
-        },
-        auth=HTTPBasicAuth(ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET),
-    )
+def decode_webm_to_pcm(audio_bytes: bytes):
+    """
+    In-memory decode from WebM/Opus → WAV/PCM (16kHz, mono).
+    Returns: (numpy.ndarray, sample_rate)
+    """
     try:
-        resp.raise_for_status()
-    except Exception:
-        raise HTTPException(401, f"Failed to fetch Zoom token: {resp.text}")
+        # Run ffmpeg to convert input bytes (pipe:0) to wav bytes (pipe:1)
+        wav_bytes, _ = (
+            ffmpeg
+            .input("pipe:0")
+            .output("pipe:1",
+                    format="wav",
+                    acodec="pcm_s16le",
+                    ac=1,
+                    ar="16000")
+            .run(input=audio_bytes, capture_stdout=True, capture_stderr=True)
+        )
+        # Now read those wav bytes into numpy
+        audio_arr, sr = sf.read(io.BytesIO(wav_bytes))
+        return audio_arr, sr
 
-    body = resp.json()
-    token_data["access_token"] = body["access_token"]
-    token_data["expires_at"]   = now + body["expires_in"]
-    return token_data["access_token"]
-
-
-@app.post("/zoom/create_meeting")
-def create_zoom_meeting(req: CreateMeetingRequest):
-    """
-    Create a Zoom meeting using server-to-server OAuth (client_credentials).
-    """
-    access_token = get_valid_access_token()
-
-    # Build payload directly from the validated request
-    payload = req.model_dump()
-
-    response = requests.post(
-        "https://api.zoom.us/v2/users/me/meetings",
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-    )
-    if response.status_code != 201:
-        raise HTTPException(400, f"Zoom meeting creation failed: {response.text}")
-
-    return response.json()
-
-asr = pipeline(
-  "automatic-speech-recognition",
-  model="openai/whisper-large-v3-turbo",
-  chunk_length_s=30,       # optional: chunk long audios
-  device="cuda" if torch.cuda.is_available() else "cpu"
-)
+    except ffmpeg.Error as e:
+        # ffmpeg stderr is in e.stderr
+        raise RuntimeError(f"FFmpeg decoding error: {e.stderr.decode()}")
 
 @app.post("/transcribe/")
 async def transcribe(file: UploadFile = File(...)):
-    """Accepts audio upload and returns transcription"""
+    """Accepts WebM/Opus upload and returns transcription"""
     audio_bytes = await file.read()
+
     try:
-        # Directly pass raw bytes to pipeline (avoids file I/O)
-        result = asr(audio_bytes)
-        return {"text": result.get("text", "")}  
+        # 1️⃣ Decode WebM → PCM
+        audio_data, sample_rate = decode_webm_to_pcm(audio_bytes)
+
+        # 2️⃣ Transcribe with chunking + VAD
+        segments, info = model.transcribe(
+            audio_data
+        )
+
+        # 3️⃣ Concatenate segment texts
+        text = " ".join(seg.text for seg in segments).strip()
+        return {"text": text}
+
     except Exception as e:
-        # Log full traceback to server console
-        import traceback; traceback.print_exc()
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Transcription error: {e}")
+    
+class TTSRequest(BaseModel):
+    text: str
+    voice: str = "en-US-JennyNeural"  # Default voice
+
+@app.post("/tts/")
+async def generate_tts(request: TTSRequest):
+    text = request.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text cannot be empty")
+
+    filename = f"tts_{uuid.uuid4().hex}.mp3"
+    filepath = f"./{filename}"
+
+    try:
+        communicate = edge_tts.Communicate(text, voice=request.voice)
+        await communicate.save(filepath)
+        return FileResponse(filepath, media_type="audio/mpeg", filename="output.mp3")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TTS generation failed: {e}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("widget:app", host="0.0.0.0", port=8000, reload=True)
