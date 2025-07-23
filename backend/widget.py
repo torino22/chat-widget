@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from faster_whisper import WhisperModel
+#from faster_whisper import WhisperModel
 import ffmpeg, io, soundfile as sf, traceback
 from typing import List
 from pydantic import BaseModel
@@ -9,7 +9,7 @@ import re
 import json
 from fastapi.responses import FileResponse
 import asyncio
-import edge_tts
+#import edge_tts
 import uuid
 import os
 from dotenv import load_dotenv
@@ -31,7 +31,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-model = WhisperModel("large-v3", device="cpu", compute_type="int8")
+#model = WhisperModel("large-v3", device="cpu", compute_type="int8")
 
 # Define request model
 class PromptRequest(BaseModel):
